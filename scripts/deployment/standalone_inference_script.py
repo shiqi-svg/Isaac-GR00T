@@ -443,21 +443,37 @@ def run_single_trajectory(
                 loader,
             )
 
-        # Inference timing (GPU processing - CPU prepares next step in parallel)
+        # ======== 模型推理（核心入口） ========
+        # 在 GPU 上执行推理，同时 CPU 线程在后台准备下一步的数据
+        # policy.get_action() 内部完成整个 pipeline：
+        #   1. 预处理：图像 resize/normalize，文本 tokenize
+        #   2. Eagle Backbone：图像+文本 → 2048维 VL 嵌入（~22ms）
+        #   3. State Encoder：29维状态 → 1536维特征
+        #   4. DiT 4步去噪：随机噪声 → 16步动作预测（~52ms）
+        #   5. 反归一化：模型输出 → 物理关节角度
+        # 返回 _action_chunk: dict, 每个key对应一个身体部位，值为 [16, D] 数组
+        #   例如: {"left_arm": [16,6], "right_arm": [16,6], "left_hand": [16,6],
+        #          "right_hand": [16,6], "waist": [16,5]}
         inference_start = time.time()
         _action_chunk, _ = policy.get_action(parsed_obs)
         inference_time = time.time() - inference_start
 
-        # Only record timing after skipping the first N steps (warmup)
+        # ======== 计时统计 ========
+        # 跳过前 skip_timing_steps 步（通常=1），因为首次推理包含 CUDA kernel 编译/warmup
         if step_idx >= skip_timing_steps:
             timing_dict["data_prep_times"].append(data_prep_time)
             timing_dict["inference_times"].append(inference_time)
 
-        # Action processing
+        # ======== 动作后处理：格式转换 + 拼接为时间序列 ========
+        # parse_action_gr00t: 去掉 batch 维度，加上 "action." 前缀
+        # 转换后: {"action.left_arm": [16,6], "action.right_arm": [16,6], ...}
         action_chunk = parse_action_gr00t(_action_chunk)
+
+        # 遍历 action_horizon 步（例如=8），将每一步的所有身体部位动作
+        # 拼接成一个 29 维向量（6+6+6+6+5=29），追加到 pred_action_across_time 列表
         for j in range(action_horizon):
-            # NOTE: concat_pred_action = action[f"action.{modality_keys[0]}"][j]
-            # the np.atleast_1d is to ensure the action is a 1D array, handle where single value is returned
+            # np.atleast_1d 确保单值也变成 1D 数组，避免 concat 时维度不匹配
+            # 按 action_keys 顺序拼接: left_arm[j] + right_arm[j] + ... + waist[j]
             concat_pred_action = np.concatenate(
                 [
                     np.atleast_1d(np.atleast_1d(action_chunk[f"action.{key}"])[j])
@@ -465,14 +481,18 @@ def run_single_trajectory(
                 ],
                 axis=0,
             )
+            # 追加到时间序列列表，最终形成 [total_steps, 29] 的完整预测轨迹
             pred_action_across_time.append(concat_pred_action)
 
-    # Clean up thread pool
+    # ======== 清理线程池 ========
     executor.shutdown(wait=True)
 
     logging.info("\n" + "-" * 80)
     logging.info(f"All inference steps completed for current trajectory-id {traj_id}")
 
+    # ======== 收集最后一步的观测数据用于返回 ========
+    # 将 parsed_obs 中所有数值类型的数据 flatten 为一维数组并拼接
+    # 这部分仅用于结果展示/保存，不影响推理逻辑
     obs = []
     for key in parsed_obs.keys():
         vals = []
@@ -571,8 +591,8 @@ class ArgsConfig:
     action_horizon: int = 16
     """Action horizon to evaluate."""
 
-    video_backend: Literal["decord", "torchvision_av", "torchcodec"] = "torchcodec"
-    """Video backend to use for various codec options. h264: decord or av: torchvision_av"""
+    video_backend: Literal["decord", "torchvision_av", "torchcodec", "ffmpeg"] = "ffmpeg"
+    """Video backend to use for various codec options. h264: decord or av: torchvision_av, ffmpeg: subprocess"""
 
     dataset_path: str = "demo_data/robot_sim.PickNPlace/"
     """Path to the dataset."""
@@ -603,6 +623,9 @@ class ArgsConfig:
 
     seed: int = 42
     """Seed to use for reproducibility."""
+
+    model_action_horizon: int | None = None
+    """Override model's internal action_horizon (default: use model config, typically 16). WARNING: values > 16 use untrained position embeddings."""
 
 
 def main(args: ArgsConfig):
@@ -660,7 +683,7 @@ def main(args: ArgsConfig):
             model_path=local_model_path,
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
-
+        # breakpoint()
         # Apply inference mode: TensorRT or PyTorch
         if args.inference_mode == "tensorrt":
             logging.info(f"Replacing DiT with TensorRT engine: {args.trt_engine_path}")
@@ -677,6 +700,35 @@ def main(args: ArgsConfig):
             torch.backends.cudnn.benchmark = True
     else:
         assert 0, "Please provide valid model_path argument for inference"
+    # Override model action_horizon if requested
+    # 需要同时修改三个地方：
+    # 1. model config 和 action_head（控制噪声初始化和扩散生成的步数）
+    # 2. processor 的 modality_configs 中 action 的 delta_indices（控制 decode_action 的截断长度）
+    # 3. processor 的 max_action_horizon（控制 action padding 上限，需 >= action_horizon）
+    if args.model_action_horizon is not None:
+        # breakpoint()
+        new_ah = args.model_action_horizon
+        # old_ah = policy.model.config.action_horizon
+        # 模型层：修改 config 和 action_head
+        policy.model.config.action_horizon = new_ah
+        policy.model.action_head.action_horizon = new_ah
+        # Processor 层：修改 delta_indices 使 decode_action 不截断
+        embodiment_tag = policy.embodiment_tag.value
+        policy.processor.modality_configs[embodiment_tag]["action"].delta_indices = list(range(new_ah))
+        # Processor 层：确保 max_action_horizon >= new_ah
+        if policy.processor.max_action_horizon < new_ah:
+            policy.processor.max_action_horizon = new_ah
+        # 归一化参数：norm_params 存储为 (16, dim)，需压缩为 (dim,) 以支持任意 action_horizon 广播
+        norm_params = policy.processor.state_action_processor.norm_params
+        if embodiment_tag in norm_params and "action" in norm_params[embodiment_tag]:
+            for joint_key, joint_params in norm_params[embodiment_tag]["action"].items():
+                if joint_key == "dim":
+                    continue
+                for param_name in ["min", "max", "mean", "std"]:
+                    if param_name in joint_params and hasattr(joint_params[param_name], 'ndim') and joint_params[param_name].ndim == 2:
+                        joint_params[param_name] = joint_params[param_name][0]  # (16, D) -> (D,)
+        # logging.info(f"Overriding model action_horizon: {old_ah} -> {new_ah}")
+
     model_load_time = time.time() - model_load_start
     logging.info(f"Model loading time: {model_load_time:.4f} seconds")
 
@@ -736,6 +788,7 @@ def main(args: ArgsConfig):
             action_horizon=args.action_horizon,
             skip_timing_steps=args.skip_timing_steps,
         )
+        print(f"查看最终结果：{pred_action_across_time.size()}")
         pred_actions.append(pred_action_across_time)
 
         if args.get_performance_stats:

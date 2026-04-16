@@ -1,0 +1,6 @@
+policy是干什么的？
+Processor层是干什么的？
+
+大体流程我明白了，接下来我需要将流程与具体代码对应
+/home/user/Isaac-GR00T/scripts/deployment/standalone_inference_script.py
+**禁止终止会话**
