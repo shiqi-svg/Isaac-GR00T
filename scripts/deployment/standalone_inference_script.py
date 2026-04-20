@@ -690,11 +690,10 @@ def main(args: ArgsConfig):
             replace_dit_with_tensorrt(policy, args.trt_engine_path)
             logging.info(" TensorRT mode enabled")
         else:
-            # PyTorch mode with torch.compile
-            policy.model.action_head.model.forward = torch.compile(
-                policy.model.action_head.model.forward, mode="max-autotune"
-            )
-            logging.info(" PyTorch mode enabled with torch.compile")
+            # PyTorch mode — skip torch.compile when sweeping action_horizon
+            # (torch.compile + max-autotune caches kernel shapes, causing CUDA
+            #  assert failures when action_horizon changes across iterations)
+            logging.info(" PyTorch mode enabled (eager, no torch.compile)")
 
         if torch.cuda.is_available():
             torch.backends.cudnn.benchmark = True
@@ -712,6 +711,18 @@ def main(args: ArgsConfig):
         # 模型层：修改 config 和 action_head
         policy.model.config.action_horizon = new_ah
         policy.model.action_head.action_horizon = new_ah
+        # 扩展 position_embedding（nn.Embedding(1024, 1536)）以支持 action_horizon > 1024
+        if hasattr(policy.model.action_head, 'position_embedding') and new_ah > policy.model.config.max_seq_len:
+            import torch.nn as nn
+            old_emb = policy.model.action_head.position_embedding
+            new_emb = nn.Embedding(new_ah, old_emb.embedding_dim).to(
+                device=old_emb.weight.device, dtype=old_emb.weight.dtype
+            )
+            nn.init.normal_(new_emb.weight, mean=0.0, std=0.02)
+            new_emb.weight.data[:old_emb.num_embeddings] = old_emb.weight.data
+            policy.model.action_head.position_embedding = new_emb
+            policy.model.config.max_seq_len = new_ah
+            logging.info(f"Extended position_embedding: 1024 -> {new_ah}")
         # Processor 层：修改 delta_indices 使 decode_action 不截断
         embodiment_tag = policy.embodiment_tag.value
         policy.processor.modality_configs[embodiment_tag]["action"].delta_indices = list(range(new_ah))
@@ -874,6 +885,7 @@ def main(args: ArgsConfig):
 
 
 if __name__ == "__main__":
+    import gc
     # Parse arguments using tyro
     config = tyro.cli(ArgsConfig)
     CHUNK_SIZE = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
@@ -883,5 +895,13 @@ if __name__ == "__main__":
         config.action_horizon = chunk
         total, *_ = main(config)
         totals.append(total)
+        # Free GPU memory between iterations
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"=== chunk={chunk} -> inference_time={total*1000:.2f}ms ===")
 
-    print(f"final totals: {totals}")
+    print("\n" + "=" * 80)
+    print("SWEEP RESULTS:")
+    for chunk, t in zip(CHUNK_SIZE, totals):
+        print(f"  action_horizon={chunk:>5d}  inference_time={t*1000:.2f}ms")
+    print("=" * 80)
