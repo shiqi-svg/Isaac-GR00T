@@ -615,7 +615,7 @@ class ArgsConfig:
     save_plot_path: str | None = None
     """Path to save the plot to."""
 
-    skip_timing_steps: int = 1
+    skip_timing_steps: int = 3
     """Number of initial inference steps to skip when calculating timing statistics (default: 1 to exclude warmup)."""
 
     get_performance_stats: bool = True
@@ -788,7 +788,7 @@ def main(args: ArgsConfig):
             action_horizon=args.action_horizon,
             skip_timing_steps=args.skip_timing_steps,
         )
-        print(f"查看最终结果：{pred_action_across_time.size()}")
+        print(f"查看最终结果：{type(pred_action_across_time)}")
         pred_actions.append(pred_action_across_time)
 
         if args.get_performance_stats:
@@ -828,8 +828,8 @@ def main(args: ArgsConfig):
         logging.info("=== DETAILED TIMING SUMMARY ===")
         logging.info("=" * 80)
         logging.info("\nInitialization:")
-        logging.info(f"  Model loading time:          {model_load_time:.4f}s")
-        logging.info(f"  Dataset loader creation:     {dataset_load_time:.4f}s")
+        logging.info(f"  Model loading time:          {model_load_time*1000:.4f}ms")
+        logging.info(f"  Dataset loader creation:     {dataset_load_time*1000:.4f}ms")
 
         if all_timings:
             # Aggregate timing statistics
@@ -842,33 +842,41 @@ def main(args: ArgsConfig):
 
             logging.info(f"\nPer-Trajectory Timings ({len(all_timings)} trajectories):")
             logging.info(
-                f"  Total episode loading:       {total_episode_load:.4f}s  (avg: {total_episode_load / len(all_timings):.4f}s)"
+                f"  Total episode loading:       {total_episode_load*1000:.4f}ms  (avg: {total_episode_load / len(all_timings)*1000:.4f}ms)"
             )
             logging.info(
-                f"  Total data preparation:      {total_data_prep:.4f}s  (avg: {total_data_prep / total_inference_steps:.4f}s per step)"
+                f"  Total data preparation:      {total_data_prep*1000:.4f}ms  (avg: {total_data_prep / total_inference_steps*1000:.4f}ms per step)"
             )
             logging.info(
-                f"  Total inference:             {total_inference:.4f}s  (avg: {total_inference / total_inference_steps:.4f}s per step)"
+                f"  Total inference:             {total_inference*1000:.4f}ms  (avg: {total_inference / total_inference_steps*1000:.4f}ms per step)"
             )
 
             logging.info("\nInference Statistics:")
             logging.info(f"  Total inference steps:       {total_inference_steps}")
             logging.info(
-                f"  Avg inference time per step: {total_inference / total_inference_steps:.4f}s"
+                f"  Avg inference time per step: {total_inference / total_inference_steps*1000:.4f}ms"
             )
 
             # Collect all inference times for min/max/p90
             all_inf_times = [t for timing in all_timings for t in timing["inference_times"]]
-            logging.info(f"  Min inference time:          {min(all_inf_times):.4f}s")
-            logging.info(f"  Max inference time:          {max(all_inf_times):.4f}s")
-            logging.info(f"  P90 inference time:          {np.percentile(all_inf_times, 90):.4f}s")
+            logging.info(f"  Min inference time:          {min(all_inf_times)*1000:.4f}ms")
+            logging.info(f"  Max inference time:          {max(all_inf_times)*1000:.4f}ms")
+            logging.info(f"  P90 inference time:          {np.percentile(all_inf_times, 90)*1000:.4f}ms")
 
     logging.info("=" * 80)
     logging.info("Done")
-    return pred_actions, obs
+    return total_inference, pred_actions, obs
 
 
 if __name__ == "__main__":
     # Parse arguments using tyro
     config = tyro.cli(ArgsConfig)
-    main(config)
+    CHUNK_SIZE = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+    totals = []
+    for chunk in CHUNK_SIZE:
+        config.model_action_horizon = chunk
+        config.action_horizon = chunk
+        total, *_ = main(config)
+        totals.append(total)
+
+    print(f"final totals: {totals}")
