@@ -459,8 +459,8 @@ def run_single_trajectory(
         inference_time = time.time() - inference_start
 
         # ======== 计时统计 ========
-        # 跳过前 skip_timing_steps 步（通常=1），因为首次推理包含 CUDA kernel 编译/warmup
-        if step_idx >= skip_timing_steps:
+        # 只记录最后一次推理的耗时（前面的步骤包含 warmup / torch.compile 开销）
+        if step_idx == len(step_counts) - 1:
             timing_dict["data_prep_times"].append(data_prep_time)
             timing_dict["inference_times"].append(inference_time)
 
@@ -831,6 +831,7 @@ def main(args: ArgsConfig):
         logging.info(f"  Model loading time:          {model_load_time*1000:.4f}ms")
         logging.info(f"  Dataset loader creation:     {dataset_load_time*1000:.4f}ms")
 
+        total_inference = 0.0
         if all_timings:
             # Aggregate timing statistics
             total_episode_load = sum(t["episode_load_time"] for t in all_timings)
@@ -844,24 +845,28 @@ def main(args: ArgsConfig):
             logging.info(
                 f"  Total episode loading:       {total_episode_load*1000:.4f}ms  (avg: {total_episode_load / len(all_timings)*1000:.4f}ms)"
             )
-            logging.info(
-                f"  Total data preparation:      {total_data_prep*1000:.4f}ms  (avg: {total_data_prep / total_inference_steps*1000:.4f}ms per step)"
-            )
-            logging.info(
-                f"  Total inference:             {total_inference*1000:.4f}ms  (avg: {total_inference / total_inference_steps*1000:.4f}ms per step)"
-            )
 
-            logging.info("\nInference Statistics:")
-            logging.info(f"  Total inference steps:       {total_inference_steps}")
-            logging.info(
-                f"  Avg inference time per step: {total_inference / total_inference_steps*1000:.4f}ms"
-            )
+            if total_inference_steps > 0:
+                logging.info(
+                    f"  Total data preparation:      {total_data_prep*1000:.4f}ms  (avg: {total_data_prep / total_inference_steps*1000:.4f}ms per step)"
+                )
+                logging.info(
+                    f"  Total inference:             {total_inference*1000:.4f}ms  (avg: {total_inference / total_inference_steps*1000:.4f}ms per step)"
+                )
 
-            # Collect all inference times for min/max/p90
-            all_inf_times = [t for timing in all_timings for t in timing["inference_times"]]
-            logging.info(f"  Min inference time:          {min(all_inf_times)*1000:.4f}ms")
-            logging.info(f"  Max inference time:          {max(all_inf_times)*1000:.4f}ms")
-            logging.info(f"  P90 inference time:          {np.percentile(all_inf_times, 90)*1000:.4f}ms")
+                logging.info("\nInference Statistics (last step only):")
+                logging.info(f"  Total inference steps:       {total_inference_steps}")
+                logging.info(
+                    f"  Avg inference time per step: {total_inference / total_inference_steps*1000:.4f}ms"
+                )
+
+                # Collect all inference times for min/max/p90
+                all_inf_times = [t for timing in all_timings for t in timing["inference_times"]]
+                logging.info(f"  Min inference time:          {min(all_inf_times)*1000:.4f}ms")
+                logging.info(f"  Max inference time:          {max(all_inf_times)*1000:.4f}ms")
+                logging.info(f"  P90 inference time:          {np.percentile(all_inf_times, 90)*1000:.4f}ms")
+            else:
+                logging.warning("  No inference steps were timed (all skipped).")
 
     logging.info("=" * 80)
     logging.info("Done")
